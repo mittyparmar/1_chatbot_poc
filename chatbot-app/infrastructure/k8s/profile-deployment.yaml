@@ -1,0 +1,394 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: profile-microfrontend
+  namespace: chatbot-app
+  labels:
+    app: profile-microfrontend
+    version: v1.0.0
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: profile-microfrontend
+  template:
+    metadata:
+      labels:
+        app: profile-microfrontend
+        version: v1.0.0
+    spec:
+      containers:
+      - name: profile-microfrontend
+        image: chatbot-app/profile-microfrontend:latest
+        ports:
+        - containerPort: 3004
+          name: http
+        - containerPort: 3004
+          name: https
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: REACT_APP_API_URL
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: api-url
+        - name: REACT_APP_WS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: ws-url
+        - name: REACT_APP_AUTH_URL
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: auth-url
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3004
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3004
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: nginx-config
+          mountPath: /etc/nginx/nginx.conf
+          subPath: nginx.conf
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: nginx-config
+        configMap:
+          name: profile-nginx-config
+      - name: tmp
+        emptyDir: {}
+      imagePullSecrets:
+      - name: docker-registry-secret
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - profile-microfrontend
+              topologyKey: "kubernetes.io/hostname"
+      tolerations:
+      - key: "node-role.kubernetes.io/master"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "node-role.kubernetes.io/control-plane"
+        operator: "Exists"
+        effect: "NoSchedule"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: profile-microfrontend-service
+  namespace: chatbot-app
+  labels:
+    app: profile-microfrontend
+spec:
+  selector:
+    app: profile-microfrontend
+  ports:
+  - name: http
+    port: 80
+    targetPort: 3004
+    protocol: TCP
+  - name: https
+    port: 443
+    targetPort: 3004
+    protocol: TCP
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: profile-microfrontend-ingress
+  namespace: chatbot-app
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/ssl-passthrough: "true"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+    nginx.ingress.kubernetes.io/rate-limit-window-size: "10"
+    nginx.ingress.kubernetes.io/rate-limit-key: "remote_addr"
+spec:
+  tls:
+  - hosts:
+    - profile.chatbot-app.com
+    secretName: profile-microfrontend-tls
+  rules:
+  - host: profile.chatbot-app.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: profile-microfrontend-service
+            port:
+              number: 80
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: profile-nginx-config
+  namespace: chatbot-app
+data:
+  nginx.conf: |
+    events {
+        worker_connections 1024;
+    }
+
+    http {
+        include       /etc/nginx/mime.types;
+        default_type  application/octet-stream;
+
+        # Logging
+        access_log /var/log/nginx/access.log;
+        error_log /var/log/nginx/error.log;
+
+        # Basic settings
+        sendfile on;
+        tcp_nopush on;
+        tcp_nodelay on;
+        keepalive_timeout 65;
+        types_hash_max_size 2048;
+
+        # Gzip compression
+        gzip on;
+        gzip_vary on;
+        gzip_min_length 10240;
+        gzip_proxied expired no-cache no-store private must-revalidate max-age=0 auth;
+        gzip_types text/plain text/css text/xml text/javascript application/javascript application/xml+rss application/json;
+
+        # Security headers
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer-when-downgrade" always;
+        add_header Content-Security-Policy "default-src 'self' http: https: data: blob: 'unsafe-inline'" always;
+
+        server {
+            listen 3004;
+            server_name localhost;
+
+            # Root directory
+            root /usr/share/nginx/html;
+            index index.html index.htm;
+
+            # Static files caching
+            location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+                expires 1y;
+                add_header Cache-Control "public, immutable";
+                try_files $uri =404;
+            }
+
+            # Cache manifest files
+            location = /manifest.webmanifest {
+                expires 0;
+                add_header Cache-Control "no-cache, no-store, must-revalidate";
+            }
+
+            # API proxy to backend
+            location /api/ {
+                proxy_pass http://backend-gateway-service:3000;
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection 'upgrade';
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_cache_bypass $http_upgrade;
+                proxy_connect_timeout 60s;
+                proxy_send_timeout 60s;
+                proxy_read_timeout 60s;
+            }
+
+            # Socket.IO proxy
+            location /socket.io/ {
+                proxy_pass http://backend-chat-service:3002;
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection "upgrade";
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+            }
+
+            # Fallback for React Router
+            location / {
+                try_files $uri $uri/ /index.html;
+                expires -1;
+                add_header Cache-Control "no-cache, no-store, must-revalidate";
+            }
+
+            # Health check
+            location /health {
+                access_log off;
+                return 200 "healthy\n";
+                add_header Content-Type text/plain;
+            }
+        }
+    }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: profile-microfrontend-hpa
+  namespace: chatbot-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: profile-microfrontend
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  - type: Pods
+    pods:
+      metric:
+        name: packets-per-second
+      target:
+        type: AverageValue
+        averageValue: 10000
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: profile-microfrontend-pdb
+  namespace: chatbot-app
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: profile-microfrontend
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: profile-microfrontend-network-policy
+  namespace: chatbot-app
+spec:
+  podSelector:
+    matchLabels:
+      app: profile-microfrontend
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: chatbot-app
+    - podSelector: {}
+    ports:
+    - protocol: TCP
+      port: 3004
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: chatbot-app
+    - podSelector: {}
+    ports:
+    - protocol: TCP
+      port: 3000
+    - protocol: TCP
+      port: 3002
+    - protocol: TCP
+      port: 3001
+    - protocol: TCP
+      port: 3003
+    - protocol: TCP
+      port: 3005
+    - protocol: TCP
+      port: 5432
+    - protocol: TCP
+      port: 6379
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 53
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 443
+---
+apiVersion: v1
+kind: ServiceMonitor
+metadata:
+  name: profile-microfrontend-monitor
+  namespace: chatbot-app
+  labels:
+    app: profile-microfrontend
+spec:
+  selector:
+    matchLabels:
+      app: profile-microfrontend
+  endpoints:
+  - port: http
+    interval: 30s
+    path: /metrics
+    honorLabels: true
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: profile-microfrontend-nginx-monitor
+  namespace: chatbot-app
+  labels:
+    app: profile-microfrontend
+    monitor: nginx
+spec:
+  selector:
+    matchLabels:
+      app: profile-microfrontend
+  endpoints:
+  - port: http
+    interval: 30s
+    path: /metrics
+    honorLabels: true

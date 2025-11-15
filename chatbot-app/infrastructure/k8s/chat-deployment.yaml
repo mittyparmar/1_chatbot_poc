@@ -1,0 +1,128 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chat-microfrontend
+  namespace: chatbot-app
+  labels:
+    app: chat-microfrontend
+    component: frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: chat-microfrontend
+  template:
+    metadata:
+      labels:
+        app: chat-microfrontend
+        component: frontend
+    spec:
+      containers:
+      - name: chat-microfrontend
+        image: chatbot-app/chat-microfrontend:latest
+        ports:
+        - containerPort: 80
+          name: http
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: REACT_APP_API_URL
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: api-url
+        - name: REACT_APP_WS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: ws-url
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      imagePullSecrets:
+      - name: docker-registry-secret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chat-microfrontend-service
+  namespace: chatbot-app
+  labels:
+    app: chat-microfrontend
+    component: frontend
+spec:
+  selector:
+    app: chat-microfrontend
+  ports:
+  - port: 80
+    targetPort: 80
+    name: http
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: chat-microfrontend-ingress
+  namespace: chatbot-app
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  tls:
+  - hosts:
+    - chat.example.com
+    secretName: chat-tls
+  rules:
+  - host: chat.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: chat-microfrontend-service
+            port:
+              number: 80
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: chat-microfrontend-hpa
+  namespace: chatbot-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: chat-microfrontend
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80

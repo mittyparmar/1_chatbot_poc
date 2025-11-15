@@ -1,0 +1,400 @@
+name: AI Service CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop, ai-service ]
+    paths:
+      - 'backend/ai/**'
+      - '.github/workflows/ai-service.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'backend/ai/**'
+      - '.github/workflows/ai-service.yml'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/ai-service
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.9']
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r backend/ai/requirements.txt
+        pip install pytest pytest-asyncio pytest-cov black flake8 mypy
+    
+    - name: Lint with flake8
+      run: |
+        flake8 backend/ai/src/ --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 backend/ai/src/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+    
+    - name: Format check with black
+      run: |
+        black --check backend/ai/src/
+    
+    - name: Type check with mypy
+      run: |
+        mypy backend/ai/src/ --ignore-missing-imports
+    
+    - name: Run tests
+      run: |
+        cd backend/ai
+        pytest --cov=src --cov-report=xml --cov-report=html --cov-report=term-missing
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./backend/ai/coverage.xml
+        flags: ai-service
+        name: ai-service-coverage
+        fail_ci_if_error: true
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
+      digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+    
+    - name: Log in to Container Registry
+      uses: docker/login-action@v2
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v4
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+    
+    - name: Build and push Docker image
+      id: build
+      uses: docker/build-push-action@v4
+      with:
+        context: backend/ai
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+    
+    - name: Upload image digest
+      uses: actions/upload-artifact@v3
+      with:
+        name: image-digest
+        path: digest.txt
+
+  security-scan:
+    needs: build
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Download image digest
+      uses: actions/download-artifact@v3
+      with:
+        name: image-digest
+        path: digest.txt
+    
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@$(cat digest.txt)
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        exit-code: '1'
+        severity: 'CRITICAL,HIGH'
+    
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  deploy-staging:
+    needs: [test, build, security-scan]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+    
+    - name: Configure kubeconfig
+      run: |
+        mkdir -p ~/.kube
+        echo "${{ secrets.KUBE_CONFIG_STAGING }}" | base64 -d > ~/.kube/config
+        chmod 600 ~/.kube/config
+    
+    - name: Download image digest
+      uses: actions/download-artifact@v3
+      with:
+        name: image-digest
+        path: digest.txt
+    
+    - name: Deploy to staging
+      run: |
+        # Update image digest in deployment
+        IMAGE_DIGEST=$(cat digest.txt)
+        sed -i "s|image: .*|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${IMAGE_DIGEST}|g" infrastructure/k8s/ai-service.yaml
+        
+        # Apply Kubernetes manifests
+        kubectl apply -f infrastructure/k8s/ai-service.yaml
+        
+        # Wait for deployment to complete
+        kubectl rollout status deployment/ai-service -n chatbot-app --timeout=300s
+        
+        # Run health checks
+        kubectl wait --for=condition=ready pod -l app=ai-service -n chatbot-app --timeout=300s
+        
+        # Run application health checks
+        kubectl exec -it deployment/ai-service -n chatbot-app -- curl -f http://localhost:8000/health
+    
+    - name: Notify deployment status
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        channel: '#deployments'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        fields: repo,message,commit,author,action,eventName,ref,workflow
+        text: 'AI Service deployment to staging completed'
+
+  deploy-production:
+    needs: [test, build, security-scan]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+    
+    - name: Configure kubeconfig
+      run: |
+        mkdir -p ~/.kube
+        echo "${{ secrets.KUBE_CONFIG_PRODUCTION }}" | base64 -d > ~/.kube/config
+        chmod 600 ~/.kube/config
+    
+    - name: Download image digest
+      uses: actions/download-artifact@v3
+      with:
+        name: image-digest
+        path: digest.txt
+    
+    - name: Deploy to production
+      run: |
+        # Update image digest in deployment
+        IMAGE_DIGEST=$(cat digest.txt)
+        sed -i "s|image: .*|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${IMAGE_DIGEST}|g" infrastructure/k8s/ai-service.yaml
+        
+        # Apply Kubernetes manifests
+        kubectl apply -f infrastructure/k8s/ai-service.yaml
+        
+        # Wait for deployment to complete
+        kubectl rollout status deployment/ai-service -n chatbot-app --timeout=300s
+        
+        # Run health checks
+        kubectl wait --for=condition=ready pod -l app=ai-service -n chatbot-app --timeout=300s
+        
+        # Run application health checks
+        kubectl exec -it deployment/ai-service -n chatbot-app -- curl -f http://localhost:8000/health
+        
+        # Run canary deployment if needed
+        kubectl set image deployment/ai-service ai-service=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@$(cat digest.txt) -n chatbot-app --record=true
+        
+        # Wait for canary deployment
+        kubectl rollout status deployment/ai-service -n chatbot-app --timeout=300s
+    
+    - name: Notify deployment status
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        channel: '#deployments'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        fields: repo,message,commit,author,action,eventName,ref,workflow
+        text: 'AI Service deployment to production completed'
+
+  rollback:
+    needs: deploy-production
+    runs-on: ubuntu-latest
+    if: failure()
+    environment: production
+    
+    steps:
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+    
+    - name: Configure kubeconfig
+      run: |
+        mkdir -p ~/.kube
+        echo "${{ secrets.KUBE_CONFIG_PRODUCTION }}" | base64 -d > ~/.kube/config
+        chmod 600 ~/.kube/config
+    
+    - name: Rollback deployment
+      run: |
+        # Rollback to previous revision
+        kubectl rollout undo deployment/ai-service -n chatbot-app
+        
+        # Wait for rollback to complete
+        kubectl rollout status deployment/ai-service -n chatbot-app --timeout=300s
+        
+        # Run health checks
+        kubectl wait --for=condition=ready pod -l app=ai-service -n chatbot-app --timeout=300s
+        
+        # Run application health checks
+        kubectl exec -it deployment/ai-service -n chatbot-app -- curl -f http://localhost:8000/health
+    
+    - name: Notify rollback status
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        channel: '#deployments'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        fields: repo,message,commit,author,action,eventName,ref,workflow
+        text: 'AI Service rollback completed'
+
+  performance-test:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install performance testing dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install locust
+    
+    - name: Run performance tests
+      run: |
+        cd backend/ai
+        locust -f ../tests/performance/locustfile.py --host=http://localhost:8000 --users=100 --spawn-rate=10 --run-time=5m --html=performance-report.html
+    
+    - name: Upload performance report
+      uses: actions/upload-artifact@v3
+      with:
+        name: performance-report
+        path: backend/ai/performance-report.html
+
+  documentation:
+    needs: test
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install documentation dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install mkdocs mkdocs-material mkdocs-mermaid2-plugin mkdocs-swagger-ui-tag
+    
+    - name: Generate API documentation
+      run: |
+        cd backend/ai
+        mkdocs build --site-dir ../docs/ai-service
+    
+    - name: Upload documentation
+      uses: actions/upload-artifact@v3
+      with:
+        name: documentation
+        path: docs/
+
+  cleanup:
+    needs: [deploy-staging, deploy-production]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+    - name: Cleanup old Docker images
+      run: |
+        # Remove images older than 30 days from registry
+        echo "Cleaning up old Docker images..."
+        # This would typically be done with a script that interacts with the registry API
+    
+    - name: Cleanup old artifacts
+      uses: actions/github-script@v6
+      with:
+        script: |
+          // Delete artifacts older than 7 days
+          const artifacts = await github.rest.actions.listArtifacts({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            per_page: 100
+          });
+          
+          const sevenDaysAgo = new Date();
+          sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+          
+          for (const artifact of artifacts.data.artifacts) {
+            const createdAt = new Date(artifact.created_at);
+            if (createdAt < sevenDaysAgo) {
+              await github.rest.actions.deleteArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: artifact.id
+              });
+              console.log(`Deleted artifact: ${artifact.name}`);
+            }
+          }
